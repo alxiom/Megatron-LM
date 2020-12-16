@@ -147,42 +147,43 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
 
     if isinstance(model, torchDDP):
         model = model.module
-    # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
-    # If no tracker file, return iretation zero.
-    if not os.path.isfile(tracker_filename):
-        print_rank_0('WARNING: could not find the metadata file {} '.format(
-            tracker_filename))
-        print_rank_0('    will not load any checkpoints and will start from '
-                     'random')
-        return 0
+    if args.from_checkpoint == -1:
+        # Read the tracker file and set the iteration.
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
-    # Otherwise, read the tracker file and either set the iteration or
-    # mark it as a release checkpoint.
-    iteration = 0
-    release = False
-    with open(tracker_filename, 'r') as f:
-        metastring = f.read().strip()
-        try:
-            iteration = int(metastring)
-        except ValueError:
-            release = metastring == 'release'
-            if not release:
-                print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
-                    tracker_filename))
-                sys.exit()
+        # If no tracker file, return iretation zero.
+        if not os.path.isfile(tracker_filename):
+            print_rank_0('WARNING: could not find the metadata file {} '.format(
+                tracker_filename))
+            print_rank_0('    will not load any checkpoints and will start from '
+                         'random')
+            return 0
 
-    if args.from_checkpoint > 0:
-        from_checkpoint_path = os.path.join(load_dir, f"iter_{args.from_checkpoint:07d}")
-        assert os.path.exists(from_checkpoint_path), f"error from_checkpoint is not exists {from_checkpoint_path}"
+        # Otherwise, read the tracker file and either set the iteration or
+        # mark it as a release checkpoint.
+        iteration = 0
+        release = False
+        with open(tracker_filename, 'r') as f:
+            metastring = f.read().strip()
+            try:
+                iteration = int(metastring)
+            except ValueError:
+                release = metastring == 'release'
+                if not release:
+                    print_rank_0('ERROR: Invalid metadata file {}. Exiting'.format(
+                        tracker_filename))
+                    sys.exit()
+
+        assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+            tracker_filename)
+    else:
         iteration = args.from_checkpoint
-
-    assert iteration > 0 or release, 'error parsing metadata file {}'.format(
-        tracker_filename)
+        release = False
 
     # Checkpoint.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+    assert os.path.exists(checkpoint_name), f"error from_checkpoint is not exists {checkpoint_name}"
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
