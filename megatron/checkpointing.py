@@ -173,6 +173,11 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
                     tracker_filename))
                 sys.exit()
 
+    if args.from_checkpoint > 0:
+        from_checkpoint_path = os.path.join(load_dir, f"iter_{args.from_checkpoint:07d}")
+        assert os.path.exists(from_checkpoint_path), f"error from_checkpoint is not exists {from_checkpoint_path}"
+        iteration = args.from_checkpoint
+
     assert iteration > 0 or release, 'error parsing metadata file {}'.format(
         tracker_filename)
 
