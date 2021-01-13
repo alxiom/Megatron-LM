@@ -25,36 +25,60 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
-try:
-    from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
-    # Try to use FusedLayerNorm from Apex - this will trigger an error.
-    _ = LayerNorm(8, eps=1e-5)
-
-except Exception as e:
-    print('WARNING: APEX is not installed, using torch.nn.LayerNorm '
-          'instead of apex.normalization.FusedLayerNorm!')
-    from torch.nn import LayerNorm
-
-from .initialize import get_model_parallel_rank
-from .initialize import get_model_parallel_world_size
-from .mappings import copy_to_model_parallel_region
-from .mappings import gather_from_model_parallel_region
-from .mappings import reduce_from_model_parallel_region
-from .mappings import scatter_to_model_parallel_region
+from .initialize import get_tensor_model_parallel_rank
+from .initialize import get_tensor_model_parallel_world_size
+from .mappings import copy_to_tensor_model_parallel_region
+from .mappings import gather_from_tensor_model_parallel_region
+from .mappings import reduce_from_tensor_model_parallel_region
+from .mappings import scatter_to_tensor_model_parallel_region
 from .random import get_cuda_rng_tracker
 from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
 from megatron import get_args
 
+
+_MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
+                                      'partition_dim': -1,
+                                      'partition_stride': 1}
+
+
+def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
+    # Make sure the attributes are not set.
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        assert not hasattr(tensor, attribute)
+    # Set the attributes.
+    setattr(tensor, 'tensor_model_parallel', is_parallel)
+    setattr(tensor, 'partition_dim', dim)
+    setattr(tensor, 'partition_stride', stride)
+
+
+def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
+    def maybe_set(attribute, value):
+        if not hasattr(tensor, attribute):
+            setattr(tensor, attribute, value)
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        maybe_set(attribute, _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS[attribute])
+
+
+def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
+    def maybe_copy(attribute):
+        if hasattr(source_tensor, attribute):
+            setattr(destination_tensor, attribute,
+                    getattr(source_tensor, attribute))
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        maybe_copy(attribute)
+
+
 def _initialize_affine_weight_gpu(weight, init_method,
                                   partition_dim, stride=1):
     """Initialize affine weight for model parallel on GPU."""
 
-    weight.model_parallel = True
-    weight.partition_dim = partition_dim
-    weight.partition_stride = stride
-    
+    set_tensor_model_parallel_attributes(tensor=weight,
+                                         is_parallel=True,
+                                         dim=partition_dim,
+                                         stride=stride)
+
     with get_cuda_rng_tracker().fork():
         init_method(weight)
 
@@ -68,9 +92,10 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     Build the master weight on all processes and scatter
     the relevant chunk."""
 
-    weight.model_parallel = True
-    weight.partition_dim = partition_dim
-    weight.partition_stride = stride
+    set_tensor_model_parallel_attributes(tensor=weight,
+                                         is_parallel=True,
+                                         dim=partition_dim,
+                                         stride=stride)
 
     # Initialize master weight
     master_weight = torch.empty(output_size, input_size,
@@ -85,7 +110,7 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     weight_list = torch.split(master_weight, per_partition_per_stride_size,
                               dim=partition_dim)
     rank = get_model_parallel_rank()
-    world_size = get_model_parallel_world_size()
+    world_size = get_tensor_model_parallel_world_size()
     my_weight_list = weight_list[rank::world_size]
 
     with torch.no_grad():
@@ -119,12 +144,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.scale_grad_by_freq = False
         self.sparse = False
         self._weight = None
-        self.model_parallel_size = get_model_parallel_world_size()
+        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         # Divide the weight matrix along the vocaburaly dimension.
         self.vocab_start_index, self.vocab_end_index = \
             VocabUtility.vocab_range_from_global_vocab_size(
-                self.num_embeddings, get_model_parallel_rank(),
-                self.model_parallel_size)
+                self.num_embeddings, get_tensor_model_parallel_rank(),
+                self.tensor_model_parallel_size)
         self.num_embeddings_per_partition = self.vocab_end_index - \
             self.vocab_start_index
 
@@ -145,7 +170,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                                           partition_dim=0, stride=1)
 
     def forward(self, input_):
-        if self.model_parallel_size > 1:
+        if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | \
                          (input_ >= self.vocab_end_index)
@@ -160,10 +185,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                                       self.norm_type, self.scale_grad_by_freq,
                                       self.sparse)
         # Mask the output embedding.
-        if self.model_parallel_size > 1:
+        if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
-        output = reduce_from_model_parallel_region(output_parallel)
+        output = reduce_from_tensor_model_parallel_region(output_parallel)
         return output
 
 
@@ -202,7 +227,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.output_size = output_size
         self.gather_output = gather_output
         # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
+        world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
 
@@ -235,7 +260,7 @@ class ColumnParallelLinear(torch.nn.Module):
                     self.output_size_per_partition,
                     device=torch.cuda.current_device(),
                     dtype=args.params_dtype))
-            self.bias.model_parallel = True
+            self.bias.tensor_model_parallel = True
             self.bias.partition_dim = 0
             self.bias.stride = stride
             # Always initialize bias to zero.
@@ -248,14 +273,14 @@ class ColumnParallelLinear(torch.nn.Module):
 
     def forward(self, input_):
         # Set up backprop all-reduce.
-        input_parallel = copy_to_model_parallel_region(input_)
+        input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
 
         bias = self.bias if not self.skip_bias_add else None
         output_parallel = F.linear(input_parallel, self.weight, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            output = gather_from_model_parallel_region(output_parallel)
+            output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
             output = output_parallel 
         output_bias = self.bias if self.skip_bias_add else None
@@ -304,7 +329,7 @@ class RowParallelLinear(torch.nn.Module):
         self.output_size = output_size
         self.input_is_parallel = input_is_parallel
         # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
+        world_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, world_size)
         self.skip_bias_add = skip_bias_add
 
@@ -348,11 +373,11 @@ class RowParallelLinear(torch.nn.Module):
         if self.input_is_parallel:
             input_parallel = input_
         else:
-            input_parallel = scatter_to_model_parallel_region(input_)
+            input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
         output_parallel = F.linear(input_parallel, self.weight)
         # All-reduce across all the partitions.
-        output_ = reduce_from_model_parallel_region(output_parallel)
+        output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:
             output = output_ + self.bias if self.bias is not None else output_
             output_bias = None

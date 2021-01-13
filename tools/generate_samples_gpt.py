@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sample Generate GPT2"""
+"""Sample Generate GPT"""
 
 import os
 import sys
@@ -23,9 +23,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
+from megatron import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
-from megatron.model import GPT2Model
+from megatron.model import (GPTModel,
+                            GPTModelFirstStage,
+                            GPTModelLastStage,
+                            GPTModelIntermediateStage)
 from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
@@ -35,8 +39,20 @@ from megatron.text_generation_utils import generate_samples_interactive
 def model_provider():
     """Build the model."""
 
-    print_rank_0('building GPT2 model ...')
-    model = GPT2Model(num_tokentypes=0, parallel_output=False)
+    print_rank_0('building GPT model ...')
+    args = get_args()
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        # Determine model based on position of stage in pipeline.
+        if mpu.is_pipeline_first_stage():
+            model = GPTModelFirstStage(num_tokentypes=0)
+        elif mpu.is_pipeline_last_stage():
+            model = GPTModelLastStage(
+                num_tokentypes=0, parallel_output=False)
+        else:
+            model = GPTModelIntermediateStage(
+                num_tokentypes=0)
+    else:
+        model = GPTModel(num_tokentypes=0, parallel_output=False)
 
     return model
 
@@ -86,7 +102,7 @@ def main():
 
     # Generate samples.
     if args.num_samples == 0:
-        args.batch_size = 1
+        args.micro_batch_size = 1
         if args.sample_input_file != None:
             generate_samples_input_from_file(model)
         else:
